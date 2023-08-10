@@ -1482,6 +1482,13 @@ inline void requestRoutesSystemLogServiceCollection(App& app)
         asyncResp->res.jsonValue["Members@odata.count"] =
             logServiceArrayLocal.size();
 #endif // BMCWEB_ENABLE_HW_ISOLATION
+
+#ifdef BMCWEB_ENABLE_LINUX_AUDIT_EVENTS
+        nlohmann::json::object_t auditLog;
+        auditLog["@odata.id"] =
+            "/redfish/v1/Systems/system/LogServices/AuditLog";
+        logServiceArray.push_back(std::move(auditLog));
+#endif // BMCWEB_ENABLE_LINUX_AUDIT_EVENTS
         });
 }
 
@@ -6562,5 +6569,129 @@ inline void requestRoutesSystemHardwareIsolationLogService(App& app)
             postSystemHardwareIsolationLogServiceClearLog);
 }
 #endif // BMCWEB_ENABLE_HW_ISOLATION
+
+#ifdef BMCWEB_ENABLE_LINUX_AUDIT_EVENTS
+/****************************************************
+ * Redfish AuditLog interfaces
+ ******************************************************/
+inline void handleLogServicesAuditLogGet(
+    crow::App& app, const crow::Request& req,
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& systemName)
+{
+    if (!redfish::setUpRedfishRoute(app, req, asyncResp))
+    {
+        return;
+    }
+    if (systemName != "system")
+    {
+        messages::resourceNotFound(asyncResp->res, "ComputerSystem",
+                                   systemName);
+
+        return;
+    }
+    asyncResp->res.jsonValue["@odata.id"] =
+        "/redfish/v1/Systems/system/LogServices/AuditLog";
+    asyncResp->res.jsonValue["@odata.type"] = "#LogService.v1_2_0.LogService";
+    asyncResp->res.jsonValue["Name"] = "Audit Log Service";
+    asyncResp->res.jsonValue["Description"] = "Audit Log Service";
+    asyncResp->res.jsonValue["Id"] = "AuditLog";
+    asyncResp->res.jsonValue["OverWritePolicy"] = "WrapsWhenFull";
+    asyncResp->res.jsonValue["Entries"]["@odata.id"] =
+        "/redfish/v1/Systems/system/LogServices/AuditLog/Entries";
+
+    std::pair<std::string, std::string> redfishDateTimeOffset =
+        redfish::time_utils::getDateTimeOffsetNow();
+    asyncResp->res.jsonValue["DateTime"] = redfishDateTimeOffset.first;
+    asyncResp->res.jsonValue["DateTimeLocalOffset"] =
+        redfishDateTimeOffset.second;
+}
+
+inline void requestRoutesAuditLogService(App& app)
+{
+    BMCWEB_ROUTE(app, "/redfish/v1/Systems/<str>/LogServices/AuditLog/")
+        .privileges(redfish::privileges::getLogService)
+        .methods(boost::beast::http::verb::get)(
+            std::bind_front(handleLogServicesAuditLogGet, std::ref(app)));
+}
+
+inline void handleLogServicesAuditLogEntriesCollectionGet(
+    crow::App& app, const crow::Request& req,
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& systemName)
+{
+    query_param::QueryCapabilities capabilities = {
+        .canDelegateTop = true,
+        .canDelegateSkip = true,
+    };
+    query_param::Query delegatedQuery;
+    if (!redfish::setUpRedfishRouteWithDelegation(app, req, asyncResp,
+                                                  delegatedQuery, capabilities))
+    {
+        return;
+    }
+
+    if (systemName != "system")
+    {
+        messages::resourceNotFound(asyncResp->res, "ComputerSystem",
+                                   systemName);
+
+        return;
+    }
+    asyncResp->res.jsonValue["@odata.type"] =
+        "#LogEntryCollection.LogEntryCollection";
+    asyncResp->res.jsonValue["@odata.id"] =
+        "/redfish/v1/Systems/system/LogServices/AuditLog/Entries";
+    asyncResp->res.jsonValue["Name"] = "Audit Log Entries";
+    asyncResp->res.jsonValue["Description"] = "Collection of Audit Log Entries";
+    asyncResp->res.jsonValue["Members"] = nlohmann::json::array();
+    asyncResp->res.jsonValue["Members@odata.count"] = 0;
+    [[maybe_unused]] size_t skip = delegatedQuery.skip.value_or(0);
+    [[maybe_unused]] size_t top =
+        delegatedQuery.top.value_or(query_param::Query::maxTop);
+
+    /* TODO: Actually get entries */
+
+    asyncResp->res.jsonValue["Members@odata.count"] = 0;
+}
+
+inline void requestRoutesAuditLogEntryCollection(App& app)
+{
+    BMCWEB_ROUTE(app, "/redfish/v1/Systems/<str>/LogServices/AuditLog/Entries/")
+        .privileges(redfish::privileges::getLogEntryCollection)
+        .methods(boost::beast::http::verb::get)(std::bind_front(
+            handleLogServicesAuditLogEntriesCollectionGet, std::ref(app)));
+}
+
+inline void handleLogServicesAuditLogEntryGet(
+    crow::App& app, const crow::Request& req,
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& systemName, const std::string& targetID)
+{
+    if (!redfish::setUpRedfishRoute(app, req, asyncResp))
+    {
+        return;
+    }
+    if (systemName != "system")
+    {
+        messages::resourceNotFound(asyncResp->res, "ComputerSystem",
+                                   systemName);
+        return;
+    }
+
+    /* TODO: Actually look for specified entry */
+    messages::resourceNotFound(asyncResp->res, "LogEntry", targetID);
+}
+
+inline void requestRoutesAuditLogEntry(App& app)
+{
+    BMCWEB_ROUTE(
+        app, "/redfish/v1/Systems/<str>/LogServices/AuditLog/Entries/<str>/")
+        .privileges(redfish::privileges::getLogEntry)
+        .methods(boost::beast::http::verb::get)(
+            std::bind_front(handleLogServicesAuditLogEntryGet, std::ref(app)));
+}
+
+#endif // BMCWEB_ENABLE_LINUX_AUDIT_EVENTS
 
 } // namespace redfish
