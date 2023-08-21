@@ -6615,7 +6615,123 @@ inline void requestRoutesAuditLogService(App& app)
             std::bind_front(handleLogServicesAuditLogGet, std::ref(app)));
 }
 
-inline void handleLogServicesAuditLogEntriesCollectionGet(
+static LogParseError
+    fillAuditLogEntryJson(const nlohmann::json& auditEntry,
+                          nlohmann::json::object_t& logEntryJson)
+{
+    if (auditEntry.is_discarded())
+    {
+        return LogParseError::parseFailed;
+    }
+
+    std::string logEntryID;
+    std::string entryTimeStr;
+    std::string logMessage;
+    std::vector<std::string> messageArgs;
+    for (const auto& item : auditEntry.items())
+    {
+        BMCWEB_LOG_DEBUG << "[key:value]=[" << item.key() << ":" << item.value()
+                         << "]";
+
+        if (item.key() == "ID")
+        {
+            logEntryID = item.value();
+        }
+
+        if (item.key() == "EventTimestamp")
+        {
+            uint64_t timestamp = item.value();
+            entryTimeStr = redfish::time_utils::getDateTimeUint(timestamp);
+            BMCWEB_LOG_DEBUG << "entryTimeStr=" << entryTimeStr;
+        }
+
+        if (item.key() == "Message")
+        {
+            logMessage = item.value();
+        }
+
+        if (item.key() == "MessageArgs")
+        {
+#if 0
+		const auto& entryArgs = item.value();
+		if (entryArgs.is_array())
+		{
+			BMCWEB_LOG_DEBUG << "MessageArgs is an array, parse it";
+			// TODO: Use K:V pairs from DBus to make sure args match
+			for (const auto& arg : entryArgs.items())
+			{
+				BMCWEB_LOG_DEBUG << "[key:value]=[" << arg.key()
+						<< ":" << arg.value() << "]";
+
+        			if (arg.key() == "op")
+				{
+					BMCWEB_LOG_DEBUG << "Found op";
+					messageArgs[0] = arg.value();
+				}
+			}
+		}
+		else
+		{
+			BMCWEB_LOG_DEBUG << "MessageArgs is NOT an array?";
+		}
+#else
+            messageArgs = item.value();
+            BMCWEB_LOG_DEBUG << "messageArgs size=" << messageArgs.size();
+#endif
+        }
+    }
+
+    /* Check that we found all of the expected fields.
+     * Doing checks separately to make debug easier, will combine after code is
+     * stabilized.
+     */
+    if (logEntryID.empty())
+    {
+        BMCWEB_LOG_ERROR << "Missing ID";
+        return LogParseError::parseFailed;
+    }
+
+    if (logMessage.empty())
+    {
+        BMCWEB_LOG_ERROR << "Missing Message";
+        return LogParseError::parseFailed;
+    }
+
+    if (entryTimeStr.empty())
+    {
+        BMCWEB_LOG_ERROR << "Missing Timestamp";
+        return LogParseError::parseFailed;
+    }
+
+    if (messageArgs.empty())
+    {
+        BMCWEB_LOG_ERROR << "Missing MessageArgs";
+        return LogParseError::parseFailed;
+    }
+
+    // Fill in the log entry with the gathered data
+    logEntryJson["@odata.type"] = "#LogEntry.v1_9_0.LogEntry";
+    logEntryJson["@odata.id"] =
+        "/redfish/v1/Systems/system/LogServices/AuditLog/Entries/" + logEntryID;
+    logEntryJson["Name"] = "Audit Log Entry";
+    logEntryJson["Id"] = logEntryID;
+    logEntryJson["Message"] = std::move(logMessage);
+#if 0
+    /* TODO: Create message registry entries
+     *       Will need one for USYS_CONFIG messages with expected
+     *       argument count, and a second one for all others with
+     *       message in second argument.
+     */
+    logEntryJson["MessageId"] = std::move(messageID);
+#endif
+    logEntryJson["MessageArgs"] = std::move(messageArgs);
+    logEntryJson["EntryType"] = "Event";
+    logEntryJson["EventTimestamp"] = std::move(entryTimeStr);
+
+    return LogParseError::success;
+}
+
+void handleLogServicesAuditLogEntriesCollectionGet(
     crow::App& app, const crow::Request& req,
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const std::string& systemName)
@@ -6638,21 +6754,85 @@ inline void handleLogServicesAuditLogEntriesCollectionGet(
 
         return;
     }
+
     asyncResp->res.jsonValue["@odata.type"] =
         "#LogEntryCollection.LogEntryCollection";
     asyncResp->res.jsonValue["@odata.id"] =
         "/redfish/v1/Systems/system/LogServices/AuditLog/Entries";
     asyncResp->res.jsonValue["Name"] = "Audit Log Entries";
     asyncResp->res.jsonValue["Description"] = "Collection of Audit Log Entries";
-    asyncResp->res.jsonValue["Members"] = nlohmann::json::array();
-    asyncResp->res.jsonValue["Members@odata.count"] = 0;
-    [[maybe_unused]] size_t skip = delegatedQuery.skip.value_or(0);
-    [[maybe_unused]] size_t top =
-        delegatedQuery.top.value_or(query_param::Query::maxTop);
+    size_t skip = delegatedQuery.skip.value_or(0);
+    size_t top = delegatedQuery.top.value_or(query_param::Query::maxTop);
 
-    /* TODO: Actually get entries */
+    nlohmann::json& logEntryArray = asyncResp->res.jsonValue["Members"];
+    if (logEntryArray.empty())
+    {
+        logEntryArray = nlohmann::json::array();
+    }
 
-    asyncResp->res.jsonValue["Members@odata.count"] = 0;
+    /* Create unique entry for each entry in log file.
+     *
+     * TODO: Callout to D-Bus to get entries instead of using hard-coded file.
+     */
+    std::ifstream logStream("/tmp/auditLogSample.json");
+    if (!logStream.is_open())
+    {
+        BMCWEB_LOG_DEBUG << "Cannot open /tmp/auditLogSample.json";
+        messages::resourceNotFound(asyncResp->res, "AuditLog",
+                                   "/tmp/auditLogSample.json");
+        asyncResp->res.jsonValue["Members@odata.count"] = 0;
+        return;
+    }
+
+    uint64_t entryCount = 0;
+    std::string logLine;
+    while (std::getline(logStream, logLine))
+    {
+        entryCount++;
+        BMCWEB_LOG_DEBUG << entryCount << ":logLine: " << logLine;
+
+        /* Handle paging using skip (number of entries to skip from the
+         * start) and top (number of entries to display).
+         * Don't waste cycles parsing if we are going to skip sending this entry
+         */
+        if (entryCount <= skip || entryCount > skip + top)
+        {
+            BMCWEB_LOG_DEBUG << "Query param skips, line=" << entryCount;
+            continue;
+        }
+
+        nlohmann::json::object_t bmcLogEntry;
+
+        auto auditEntry = nlohmann::json::parse(logLine, nullptr, false);
+        BMCWEB_LOG_DEBUG << "auditEntry: " << auditEntry.dump();
+
+        LogParseError status = fillAuditLogEntryJson(auditEntry, bmcLogEntry);
+
+        if (status != LogParseError::success)
+        {
+            BMCWEB_LOG_DEBUG << "Failed to parse line=" << entryCount;
+#if 0
+            messages::internalError(asyncResp->res);
+            return;
+#else
+            /* For prototype keep going on parse failure,
+             * return just the entries we were able to parse.
+             */
+            continue;
+#endif
+        }
+
+        logEntryArray.push_back(std::move(bmcLogEntry));
+    }
+
+    asyncResp->res.jsonValue["Members@odata.count"] = entryCount;
+
+    if (skip + top < entryCount)
+    {
+        asyncResp->res.jsonValue["Members@odata.nextLink"] =
+            "/redfish/v1/Systems/system/LogServices/AuditLog/Entries?$skip=" +
+            std::to_string(skip + top);
+    }
 }
 
 inline void requestRoutesAuditLogEntryCollection(App& app)
@@ -6679,7 +6859,46 @@ inline void handleLogServicesAuditLogEntryGet(
         return;
     }
 
-    /* TODO: Actually look for specified entry */
+    /* Search for entry matching targetID.
+     *
+     * TODO: Callout to D-Bus to get entries instead of using hard-coded file.
+     */
+    std::ifstream logStream("/tmp/auditLogSample.json");
+    if (!logStream.is_open())
+    {
+        messages::resourceNotFound(asyncResp->res, "AuditLog",
+                                   "/tmp/auditLogSample.json");
+        return;
+    }
+
+    uint64_t entryCount = 0;
+    std::string logLine;
+    while (std::getline(logStream, logLine))
+    {
+        entryCount++;
+        BMCWEB_LOG_DEBUG << entryCount << ":logLine: " << logLine;
+
+        auto auditEntry = nlohmann::json::parse(logLine, nullptr, false);
+        BMCWEB_LOG_DEBUG << "auditEntry: " << auditEntry.dump();
+
+        auto idIt = auditEntry.find("ID");
+        if (idIt != auditEntry.end() && *idIt == targetID)
+
+        {
+            nlohmann::json::object_t bmcLogEntry;
+            LogParseError status = fillAuditLogEntryJson(auditEntry,
+                                                         bmcLogEntry);
+            if (status != LogParseError::success)
+            {
+                BMCWEB_LOG_DEBUG << "Failed to parse line=" << entryCount;
+                messages::internalError(asyncResp->res);
+                return;
+            }
+            asyncResp->res.jsonValue.update(bmcLogEntry);
+            return;
+        }
+    }
+
     messages::resourceNotFound(asyncResp->res, "LogEntry", targetID);
 }
 
