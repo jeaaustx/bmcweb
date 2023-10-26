@@ -6626,8 +6626,11 @@ static LogParseError
 
     std::string logEntryID;
     std::string entryTimeStr;
-    std::string logMessage;
-    std::vector<std::string> messageArgs;
+    std::string messageID;
+    nlohmann::json messageArgs = nlohmann::json::array();
+#if 0
+    /* TODO: Need to replace use of items(), see trello card */
+#endif
     for (const auto& item : auditEntry.items())
     {
         BMCWEB_LOG_DEBUG << "[key:value]=[" << item.key() << ":" << item.value()
@@ -6642,58 +6645,58 @@ static LogParseError
         {
             uint64_t timestamp = item.value();
             entryTimeStr = redfish::time_utils::getDateTimeUint(timestamp);
-            BMCWEB_LOG_DEBUG << "entryTimeStr=" << entryTimeStr;
         }
 
-        if (item.key() == "Message")
+        if (item.key() == "MessageId")
         {
-            logMessage = item.value();
+            messageID = item.value();
         }
 
         if (item.key() == "MessageArgs")
         {
-#if 0
-		const auto& entryArgs = item.value();
-		if (entryArgs.is_array())
-		{
-			BMCWEB_LOG_DEBUG << "MessageArgs is an array, parse it";
-			// TODO: Use K:V pairs from DBus to make sure args match
-			for (const auto& arg : entryArgs.items())
-			{
-				BMCWEB_LOG_DEBUG << "[key:value]=[" << arg.key()
-						<< ":" << arg.value() << "]";
-
-        			if (arg.key() == "op")
-				{
-					BMCWEB_LOG_DEBUG << "Found op";
-					messageArgs[0] = arg.value();
-				}
-			}
-		}
-		else
-		{
-			BMCWEB_LOG_DEBUG << "MessageArgs is NOT an array?";
-		}
-#else
             messageArgs = item.value();
             BMCWEB_LOG_DEBUG << "messageArgs size=" << messageArgs.size();
-#endif
         }
     }
 
-    /* Check that we found all of the expected fields.
-     * Doing checks separately to make debug easier, will combine after code is
-     * stabilized.
-     */
-    if (logEntryID.empty())
+    if (messageID.empty())
     {
-        BMCWEB_LOG_ERROR << "Missing ID";
+        BMCWEB_LOG_ERROR << "Missing MessageID";
         return LogParseError::parseFailed;
     }
 
-    if (logMessage.empty())
+    // Get the Message from the MessageRegistry
+    const registries::Message* message = registries::getMessage(messageID);
+
+    if (message == nullptr)
     {
-        BMCWEB_LOG_ERROR << "Missing Message";
+        BMCWEB_LOG_WARNING << "Log entry not found in registry: " << messageID;
+        return LogParseError::messageIdNotInRegistry;
+    }
+
+    std::string msg = message->message;
+
+    // Fill the MessageArgs into the Message
+    // TODO: Error handling, check that we have expected # args
+    if (messageArgs.size() > 0)
+    {
+        int i = 0;
+        for (auto messageArg : messageArgs)
+        {
+            BMCWEB_LOG_DEBUG << "messageArgs[" << i << "] = " << messageArg;
+            std::string argStr = "%" + std::to_string(++i);
+            size_t argPos = msg.find(argStr);
+            if (argPos != std::string::npos)
+            {
+                msg.replace(argPos, argStr.length(), messageArg);
+            }
+        }
+    }
+
+    // Check that we found all of the expected fields.
+    if (logEntryID.empty())
+    {
+        BMCWEB_LOG_ERROR << "Missing ID";
         return LogParseError::parseFailed;
     }
 
@@ -6703,27 +6706,14 @@ static LogParseError
         return LogParseError::parseFailed;
     }
 
-    if (messageArgs.empty())
-    {
-        BMCWEB_LOG_ERROR << "Missing MessageArgs";
-        return LogParseError::parseFailed;
-    }
-
     // Fill in the log entry with the gathered data
     logEntryJson["@odata.type"] = "#LogEntry.v1_9_0.LogEntry";
     logEntryJson["@odata.id"] =
         "/redfish/v1/Systems/system/LogServices/AuditLog/Entries/" + logEntryID;
     logEntryJson["Name"] = "Audit Log Entry";
     logEntryJson["Id"] = logEntryID;
-    logEntryJson["Message"] = std::move(logMessage);
-#if 0
-    /* TODO: Create message registry entries
-     *       Will need one for USYS_CONFIG messages with expected
-     *       argument count, and a second one for all others with
-     *       message in second argument.
-     */
     logEntryJson["MessageId"] = std::move(messageID);
-#endif
+    logEntryJson["Message"] = std::move(msg);
     logEntryJson["MessageArgs"] = std::move(messageArgs);
     logEntryJson["EntryType"] = "Event";
     logEntryJson["EventTimestamp"] = std::move(entryTimeStr);
@@ -6811,15 +6801,8 @@ void handleLogServicesAuditLogEntriesCollectionGet(
         if (status != LogParseError::success)
         {
             BMCWEB_LOG_DEBUG << "Failed to parse line=" << entryCount;
-#if 0
             messages::internalError(asyncResp->res);
             return;
-#else
-            /* For prototype keep going on parse failure,
-             * return just the entries we were able to parse.
-             */
-            continue;
-#endif
         }
 
         logEntryArray.push_back(std::move(bmcLogEntry));
