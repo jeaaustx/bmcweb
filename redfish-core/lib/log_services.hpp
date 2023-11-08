@@ -6764,12 +6764,40 @@ void handleLogServicesAuditLogEntriesCollectionGet(
      *
      * TODO: Callout to D-Bus to get entries instead of using hard-coded file.
      */
-    std::ifstream logStream("/tmp/auditLogSample.json");
+#if 1
+    const std::string parseFileName = "/tmp/auditLog.json";
+    crow::connections::systemBus->async_method_call(
+        [asyncResp](const boost::system::error_code ec) {
+        if (ec)
+        {
+            BMCWEB_LOG_ERROR << "AuditLog resp_handler got error " << ec;
+            messages::internalError(asyncResp->res);
+            return;
+        }
+
+        /* Put in here call to read the file */
+        },
+        "xyz.openbmc_project.logging.auditlog",
+        "/xyz/openbmc_project/logging/auditlog",
+        "xyz.openbmc_project.Logging.AuditLog", "ParseAuditLog", parseFileName);
+
+    /* From busctl call:
+     * service: xyz.openbmc_project.logging.auditlog
+     * object: /xyz/openbmc_project/logging/auditlog
+     * interface: xyz.openbmc_project.Logging.AuditLog
+     * method: ParseAuditLog
+     * signature: s
+     * argument: "a"
+    */
+
+#else
+    const std::string parseFileName = "/tmp/auditLogSample.json";
+#endif
+    std::ifstream logStream(parseFileName);
     if (!logStream.is_open())
     {
-        BMCWEB_LOG_DEBUG << "Cannot open /tmp/auditLogSample.json";
-        messages::resourceNotFound(asyncResp->res, "AuditLog",
-                                   "/tmp/auditLogSample.json");
+        BMCWEB_LOG_DEBUG << "Cannot open " << parseFileName;
+        messages::resourceNotFound(asyncResp->res, "AuditLog", parseFileName);
         asyncResp->res.jsonValue["Members@odata.count"] = 0;
         return;
     }
