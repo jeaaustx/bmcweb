@@ -6721,38 +6721,73 @@ static LogParseError
     return LogParseError::success;
 }
 
-void handleLogServicesAuditLogEntriesCollectionGet(
-    crow::App& app, const crow::Request& req,
-    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
-    const std::string& systemName)
+/**
+ * @brief Read single line from POSIX stream
+ *
+ * @param[in] logStream - POSIX stream
+ * @param[out] logLine - Filled in with line read on success
+ *
+ * @return True if line was read. False if EOF reached or line
+ *         exceeds 4096 characters
+ */
+inline bool readLine(FILE* logStream, std::string& logLine)
 {
-    query_param::QueryCapabilities capabilities = {
-        .canDelegateTop = true,
-        .canDelegateSkip = true,
-    };
-    query_param::Query delegatedQuery;
-    if (!redfish::setUpRedfishRouteWithDelegation(app, req, asyncResp,
-                                                  delegatedQuery, capabilities))
+    std::array<char, 4096> buffer;
+
+    if (fgets(buffer.data(), buffer.size(), logStream) == nullptr)
     {
+        /* Failed to read, could be EOF */
+        return false;
+    }
+
+    logLine.assign(buffer.data());
+
+#if 0
+    /* Could repeat reads or increase size of buffer.
+     * Don't expect log lines to be longer than 4096 so
+     * erroring out to protect against malformed data.
+     */
+    if (!logLine.ends_with('\n'))
+    {
+            /* Line was too long for the buffer.
+             * Try one more read for rest of the line.
+             */
+        if (fgets(buffer.data(), buffer.size(), logStream) != nullptr)
+        {
+            logLine.append(buffer.data());
+        }
+    }
+#endif
+
+    /* Return success only if we got a complete line */
+    return logLine.ends_with('\n');
+}
+
+/**
+ * @brief Reads the audit log entries and writes them to Members array
+ *
+ * @param[in] asyncResp - The redfish response to return.
+ * @param[in] unixfd - File descriptor for Audit Log file
+ * @param[in] skip - Query paramater skip value
+ * @param[in] top - Query paramater top value
+ */
+void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+                         const sdbusplus::message::unix_fd& unixfd, size_t skip,
+                         size_t top)
+{
+    auto fd = dup(unixfd);
+    if (fd == -1)
+    {
+        messages::internalError(asyncResp->res);
         return;
     }
 
-    if (systemName != "system")
+    auto logStream = fdopen(fd, "r");
+    if (logStream == nullptr)
     {
-        messages::resourceNotFound(asyncResp->res, "ComputerSystem",
-                                   systemName);
-
+        messages::internalError(asyncResp->res);
         return;
     }
-
-    asyncResp->res.jsonValue["@odata.type"] =
-        "#LogEntryCollection.LogEntryCollection";
-    asyncResp->res.jsonValue["@odata.id"] =
-        "/redfish/v1/Systems/system/LogServices/AuditLog/Entries";
-    asyncResp->res.jsonValue["Name"] = "Audit Log Entries";
-    asyncResp->res.jsonValue["Description"] = "Collection of Audit Log Entries";
-    size_t skip = delegatedQuery.skip.value_or(0);
-    size_t top = delegatedQuery.top.value_or(query_param::Query::maxTop);
 
     nlohmann::json& logEntryArray = asyncResp->res.jsonValue["Members"];
     if (logEntryArray.empty())
@@ -6760,51 +6795,9 @@ void handleLogServicesAuditLogEntriesCollectionGet(
         logEntryArray = nlohmann::json::array();
     }
 
-    /* Create unique entry for each entry in log file.
-     *
-     * TODO: Callout to D-Bus to get entries instead of using hard-coded file.
-     */
-#if 1
-    const std::string parseFileName = "/tmp/auditLog.json";
-    crow::connections::systemBus->async_method_call(
-        [asyncResp](const boost::system::error_code ec) {
-        if (ec)
-        {
-            BMCWEB_LOG_ERROR << "AuditLog resp_handler got error " << ec;
-            messages::internalError(asyncResp->res);
-            return;
-        }
-
-        /* Put in here call to read the file */
-        },
-        "xyz.openbmc_project.logging.auditlog",
-        "/xyz/openbmc_project/logging/auditlog",
-        "xyz.openbmc_project.Logging.AuditLog", "ParseAuditLog", parseFileName);
-
-    /* From busctl call:
-     * service: xyz.openbmc_project.logging.auditlog
-     * object: /xyz/openbmc_project/logging/auditlog
-     * interface: xyz.openbmc_project.Logging.AuditLog
-     * method: ParseAuditLog
-     * signature: s
-     * argument: "a"
-    */
-
-#else
-    const std::string parseFileName = "/tmp/auditLogSample.json";
-#endif
-    std::ifstream logStream(parseFileName);
-    if (!logStream.is_open())
-    {
-        BMCWEB_LOG_DEBUG << "Cannot open " << parseFileName;
-        messages::resourceNotFound(asyncResp->res, "AuditLog", parseFileName);
-        asyncResp->res.jsonValue["Members@odata.count"] = 0;
-        return;
-    }
-
     uint64_t entryCount = 0;
     std::string logLine;
-    while (std::getline(logStream, logLine))
+    while (readLine(logStream, logLine))
     {
         entryCount++;
         BMCWEB_LOG_DEBUG << entryCount << ":logLine: " << logLine;
@@ -6844,6 +6837,61 @@ void handleLogServicesAuditLogEntriesCollectionGet(
             "/redfish/v1/Systems/system/LogServices/AuditLog/Entries?$skip=" +
             std::to_string(skip + top);
     }
+
+    /* Not writing to file, so can safely ignore error on close */
+    (void)fclose(logStream);
+}
+
+void handleLogServicesAuditLogEntriesCollectionGet(
+    crow::App& app, const crow::Request& req,
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& systemName)
+{
+    query_param::QueryCapabilities capabilities = {
+        .canDelegateTop = true,
+        .canDelegateSkip = true,
+    };
+    query_param::Query delegatedQuery;
+    if (!redfish::setUpRedfishRouteWithDelegation(app, req, asyncResp,
+                                                  delegatedQuery, capabilities))
+    {
+        return;
+    }
+
+    if (systemName != "system")
+    {
+        messages::resourceNotFound(asyncResp->res, "ComputerSystem",
+                                   systemName);
+
+        return;
+    }
+
+    asyncResp->res.jsonValue["@odata.type"] =
+        "#LogEntryCollection.LogEntryCollection";
+    asyncResp->res.jsonValue["@odata.id"] =
+        "/redfish/v1/Systems/system/LogServices/AuditLog/Entries";
+    asyncResp->res.jsonValue["Name"] = "Audit Log Entries";
+    asyncResp->res.jsonValue["Description"] = "Collection of Audit Log Entries";
+    size_t skip = delegatedQuery.skip.value_or(0);
+    size_t top = delegatedQuery.top.value_or(query_param::Query::maxTop);
+
+    /* Create unique entry for each entry in log file.
+     */
+    crow::connections::systemBus->async_method_call(
+        [asyncResp, skip, top](const boost::system::error_code ec,
+                               const sdbusplus::message::unix_fd& unixfd) {
+        if (ec)
+        {
+            BMCWEB_LOG_ERROR << "AuditLog resp_handler got error " << ec;
+            messages::internalError(asyncResp->res);
+            return;
+        }
+
+        readAuditLogEntries(asyncResp, unixfd, skip, top);
+        },
+        "xyz.openbmc_project.logging.auditlog",
+        "/xyz/openbmc_project/logging/auditlog",
+        "xyz.openbmc_project.Logging.AuditLog", "GetAuditLog");
 }
 
 inline void requestRoutesAuditLogEntryCollection(App& app)
