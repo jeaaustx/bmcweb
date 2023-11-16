@@ -6842,6 +6842,72 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     (void)fclose(logStream);
 }
 
+/**
+ * @brief Retrieves the targetID entry from the unixfd
+ *
+ * @param[in] asyncResp - The redfish response to return.
+ * @param[in] unixfd - File descriptor for Audit Log file
+ * @param[in] targetID - ID of entry to retrieve
+ */
+void getAuditLogEntryByID(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+                          const sdbusplus::message::unix_fd& unixfd,
+                          const std::string& targetID)
+{
+    bool found = false;
+
+    auto fd = dup(unixfd);
+    if (fd == -1)
+    {
+        messages::internalError(asyncResp->res);
+        return;
+    }
+
+    auto logStream = fdopen(fd, "r");
+    if (logStream == nullptr)
+    {
+        messages::internalError(asyncResp->res);
+        return;
+    }
+
+    uint64_t entryCount = 0;
+    std::string logLine;
+    while (readLine(logStream, logLine))
+    {
+        entryCount++;
+        BMCWEB_LOG_DEBUG << entryCount << ":logLine: " << logLine;
+
+        auto auditEntry = nlohmann::json::parse(logLine, nullptr, false);
+        BMCWEB_LOG_DEBUG << "auditEntry: " << auditEntry.dump();
+
+        auto idIt = auditEntry.find("ID");
+        if (idIt != auditEntry.end() && *idIt == targetID)
+        {
+            found = true;
+            nlohmann::json::object_t bmcLogEntry;
+            LogParseError status = fillAuditLogEntryJson(auditEntry,
+                                                         bmcLogEntry);
+            if (status != LogParseError::success)
+            {
+                BMCWEB_LOG_DEBUG << "Failed to parse line=" << entryCount;
+                messages::internalError(asyncResp->res);
+            }
+            else
+            {
+                asyncResp->res.jsonValue.update(bmcLogEntry);
+            }
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        messages::resourceNotFound(asyncResp->res, "LogEntry", targetID);
+    }
+
+    /* Not writing to file, so can safely ignore error on close */
+    (void)fclose(logStream);
+}
+
 void handleLogServicesAuditLogEntriesCollectionGet(
     crow::App& app, const crow::Request& req,
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
@@ -6918,47 +6984,22 @@ inline void handleLogServicesAuditLogEntryGet(
         return;
     }
 
-    /* Search for entry matching targetID.
-     *
-     * TODO: Callout to D-Bus to get entries instead of using hard-coded file.
-     */
-    std::ifstream logStream("/tmp/auditLogSample.json");
-    if (!logStream.is_open())
-    {
-        messages::resourceNotFound(asyncResp->res, "AuditLog",
-                                   "/tmp/auditLogSample.json");
-        return;
-    }
-
-    uint64_t entryCount = 0;
-    std::string logLine;
-    while (std::getline(logStream, logLine))
-    {
-        entryCount++;
-        BMCWEB_LOG_DEBUG << entryCount << ":logLine: " << logLine;
-
-        auto auditEntry = nlohmann::json::parse(logLine, nullptr, false);
-        BMCWEB_LOG_DEBUG << "auditEntry: " << auditEntry.dump();
-
-        auto idIt = auditEntry.find("ID");
-        if (idIt != auditEntry.end() && *idIt == targetID)
-
+    /* Search for entry matching targetID. */
+    crow::connections::systemBus->async_method_call(
+        [asyncResp, targetID](const boost::system::error_code ec,
+                              const sdbusplus::message::unix_fd& unixfd) {
+        if (ec)
         {
-            nlohmann::json::object_t bmcLogEntry;
-            LogParseError status = fillAuditLogEntryJson(auditEntry,
-                                                         bmcLogEntry);
-            if (status != LogParseError::success)
-            {
-                BMCWEB_LOG_DEBUG << "Failed to parse line=" << entryCount;
-                messages::internalError(asyncResp->res);
-                return;
-            }
-            asyncResp->res.jsonValue.update(bmcLogEntry);
+            BMCWEB_LOG_ERROR << "AuditLog resp_handler got error " << ec;
+            messages::internalError(asyncResp->res);
             return;
         }
-    }
 
-    messages::resourceNotFound(asyncResp->res, "LogEntry", targetID);
+        getAuditLogEntryByID(asyncResp, unixfd, targetID);
+        },
+        "xyz.openbmc_project.logging.auditlog",
+        "/xyz/openbmc_project/logging/auditlog",
+        "xyz.openbmc_project.Logging.AuditLog", "GetAuditLog");
 }
 
 inline void requestRoutesAuditLogEntry(App& app)
