@@ -6670,50 +6670,57 @@ inline void requestRoutesAuditLogService(App& app)
 }
 
 static LogParseError
-    fillAuditLogEntryJson(const nlohmann::json& auditEntry,
+    fillAuditLogEntryJson(const dbus::utility::DBusPropertiesMap& properties,
                           nlohmann::json::object_t& logEntryJson)
 {
-    if (auditEntry.is_discarded())
-    {
-        return LogParseError::parseFailed;
-    }
-
-    std::string logEntryID;
+    const std::string* logEntryID = nullptr;
     std::string entryTimeStr;
-    std::string messageID;
+    const std::string* messageID = nullptr;
     nlohmann::json messageArgs = nlohmann::json::array();
-    for (const auto& item : auditEntry.items())
+    for (const auto& [name, value] : properties)
     {
-        if (item.key() == "ID")
+        BMCWEB_LOG_DEBUG << "Property found: " << name;
+        if (name == "ID")
         {
-            logEntryID = item.value();
+            logEntryID = std::get_if<std::string>(&value);
         }
 
-        else if (item.key() == "EventTimestamp")
+        else if (name == "EventTimestamp")
         {
-            uint64_t timestamp = item.value();
-            entryTimeStr = redfish::time_utils::getDateTimeUint(timestamp);
+            const uint64_t* timestamp = std::get_if<std::uint64_t>(&value);
+            if (timestamp != nullptr)
+            {
+                entryTimeStr = redfish::time_utils::getDateTimeUint(*timestamp);
+            }
         }
 
-        else if (item.key() == "MessageId")
+        else if (name == "MessageId")
         {
-            messageID = item.value();
+            messageID = std::get_if<std::string>(&value);
         }
 
-        else if (item.key() == "MessageArgs")
+        else if (name == "MessageArgs")
         {
-            messageArgs = item.value();
+            const std::vector<std::string>* msgArgs =
+                std::get_if<std::vector<std::string>>(&value);
+            if (msgArgs != nullptr)
+            {
+                for (const auto& arg : *msgArgs)
+                {
+                    messageArgs.push_back(arg);
+                }
+            }
         }
     }
 
     // Check that we found all of the expected fields.
-    if (messageID.empty())
+    if ((messageID == nullptr) || messageID->empty())
     {
         BMCWEB_LOG_ERROR << "Missing MessageID";
         return LogParseError::parseFailed;
     }
 
-    if (logEntryID.empty())
+    if ((logEntryID == nullptr) || logEntryID->empty())
     {
         BMCWEB_LOG_ERROR << "Missing ID";
         return LogParseError::parseFailed;
@@ -6726,11 +6733,11 @@ static LogParseError
     }
 
     // Get the Message from the MessageRegistry
-    const registries::Message* message = registries::getMessage(messageID);
+    const registries::Message* message = registries::getMessage(*messageID);
 
     if (message == nullptr)
     {
-        BMCWEB_LOG_WARNING << "Log entry not found in registry: " << messageID;
+        BMCWEB_LOG_WARNING << "Log entry not found in registry: " << *messageID;
         return LogParseError::messageIdNotInRegistry;
     }
 
@@ -6767,10 +6774,11 @@ static LogParseError
     // Fill in the log entry with the gathered data
     logEntryJson["@odata.type"] = "#LogEntry.v1_9_0.LogEntry";
     logEntryJson["@odata.id"] =
-        "/redfish/v1/Systems/system/LogServices/AuditLog/Entries/" + logEntryID;
+        "/redfish/v1/Systems/system/LogServices/AuditLog/Entries/" +
+        *logEntryID;
     logEntryJson["Name"] = "Audit Log Entry";
-    logEntryJson["Id"] = logEntryID;
-    logEntryJson["MessageId"] = std::move(messageID);
+    logEntryJson["Id"] = *logEntryID;
+    logEntryJson["MessageId"] = std::move(*messageID);
     logEntryJson["Message"] = std::move(msg);
     logEntryJson["MessageArgs"] = std::move(messageArgs);
     logEntryJson["EntryType"] = "Event";
@@ -6867,26 +6875,10 @@ inline bool readLine(FILE* logStream, std::string& logLine)
  * @param[in] top - Query paramater top value
  */
 void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
-                         const sdbusplus::message::unix_fd& unixfd, size_t skip,
-                         size_t top)
+                         const dbus::utility::ManagedObjectType& objects,
+                         size_t skip, size_t top)
 {
-    auto fd = dup(unixfd);
-    if (fd == -1)
-    {
-        BMCWEB_LOG_ERROR << "Failed to duplicate fd " << unixfd;
-        messages::internalError(asyncResp->res);
-        return;
-    }
-
-    auto logStream = fdopen(fd, "r");
-    if (logStream == nullptr)
-    {
-        BMCWEB_LOG_ERROR << "Failed to open fd " << fd;
-        messages::internalError(asyncResp->res);
-        close(fd);
-        return;
-    }
-
+    BMCWEB_LOG_DEBUG << "readAuditLogEntries: " << skip << ":" << top;
     nlohmann::json& logEntryArray = asyncResp->res.jsonValue["Members"];
     if (logEntryArray.empty())
     {
@@ -6894,15 +6886,14 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     }
 
     uint64_t entryCount = 0;
-    std::string logLine;
-    while (readLine(logStream, logLine))
+    for (const auto& [objectPath, interfaces] : objects)
     {
         /* Note: entryCount counts all entries even ones with parse errors.
          *       This allows the top/skip semantics to work correctly and a
          *       consistent count to be returned.
          */
         entryCount++;
-        BMCWEB_LOG_DEBUG << entryCount << ":logLine: " << logLine;
+        BMCWEB_LOG_DEBUG << entryCount << ":path: " << objectPath.str;
 
         /* Handle paging using skip (number of entries to skip from the
          * start) and top (number of entries to display).
@@ -6914,19 +6905,26 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
             continue;
         }
 
-        nlohmann::json::object_t bmcLogEntry;
-
-        auto auditEntry = nlohmann::json::parse(logLine, nullptr, false);
-
-        LogParseError status = fillAuditLogEntryJson(auditEntry, bmcLogEntry);
-        if (status != LogParseError::success)
+        for (const auto& [interface, properties] : interfaces)
         {
-            BMCWEB_LOG_ERROR << "Failed to parse line=" << entryCount;
-            messages::internalError(asyncResp->res);
-            continue;
-        }
+            if (interface != "xyz.openbmc_project.Logging.AuditLog.AuditEntry")
+            {
+                continue;
+            }
 
-        logEntryArray.push_back(std::move(bmcLogEntry));
+            nlohmann::json::object_t bmcLogEntry;
+
+            LogParseError status = fillAuditLogEntryJson(properties,
+                                                         bmcLogEntry);
+            if (status != LogParseError::success)
+            {
+                BMCWEB_LOG_ERROR << "Failed to parse line=" << entryCount;
+                messages::internalError(asyncResp->res);
+                continue;
+            }
+
+            logEntryArray.push_back(std::move(bmcLogEntry));
+        }
     }
 
     asyncResp->res.jsonValue["Members@odata.count"] = entryCount;
@@ -6937,76 +6935,53 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
             "/redfish/v1/Systems/system/LogServices/AuditLog/Entries?$skip=" +
             std::to_string(skip + top);
     }
-
-    /* Not writing to file, so can safely ignore error on close */
-    (void)fclose(logStream);
 }
 
 /**
- * @brief Retrieves the targetID entry from the unixfd
+ * @brief Retrieves the targetID object's properties
  *
  * @param[in] asyncResp - The redfish response to return.
- * @param[in] unixfd - File descriptor for Audit Log file
  * @param[in] targetID - ID of entry to retrieve
  */
 void getAuditLogEntryByID(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
-                          const sdbusplus::message::unix_fd& unixfd,
                           const std::string& targetID)
 {
-    bool found = false;
+    std::string objectPath =
+        std::format("/xyz/openbmc_project/logging/auditlog/{}", targetID);
 
-    auto fd = dup(unixfd);
-    if (fd == -1)
-    {
-        BMCWEB_LOG_ERROR << "Failed to duplicate fd " << unixfd;
-        messages::internalError(asyncResp->res);
-        return;
-    }
-
-    auto logStream = fdopen(fd, "r");
-    if (logStream == nullptr)
-    {
-        BMCWEB_LOG_ERROR << "Failed to open fd " << fd;
-        messages::internalError(asyncResp->res);
-        close(fd);
-        return;
-    }
-
-    uint64_t entryCount = 0;
-    std::string logLine;
-    while (readLine(logStream, logLine))
-    {
-        entryCount++;
-        BMCWEB_LOG_DEBUG << entryCount << ":logLine: " << logLine;
-
-        auto auditEntry = nlohmann::json::parse(logLine, nullptr, false);
-        auto idIt = auditEntry.find("ID");
-        if (idIt != auditEntry.end() && *idIt == targetID)
+    sdbusplus::asio::getAllProperties(
+        *crow::connections::systemBus, "xyz.openbmc_project.Logging.AuditLog",
+        objectPath, "xyz.openbmc_project.Logging.AuditLog.AuditEntry",
+        [asyncResp, objectPath,
+         targetID](const boost::system::error_code ec,
+                   const dbus::utility::DBusPropertiesMap& propertiesList) {
+        if (ec)
         {
-            found = true;
-            nlohmann::json::object_t bmcLogEntry;
-            LogParseError status = fillAuditLogEntryJson(auditEntry,
-                                                         bmcLogEntry);
-            if (status != LogParseError::success)
+            if (ec.value() == EBADR)
             {
-                BMCWEB_LOG_ERROR << "Failed to parse line=" << entryCount;
-                messages::internalError(asyncResp->res);
+                messages::resourceNotFound(asyncResp->res, "LogEntry",
+                                           targetID);
+                return;
             }
-            else
-            {
-                asyncResp->res.jsonValue.update(bmcLogEntry);
-            }
-            break;
+
+            BMCWEB_LOG_ERROR << "Dbus error: " << ec.value();
+            messages::internalError(asyncResp->res);
+            return;
         }
-    }
 
-    if (!found)
-    {
-        messages::resourceNotFound(asyncResp->res, "LogEntry", targetID);
-    }
-
-    /* Not writing to file, so can safely ignore error on close */
-    (void)fclose(logStream);
+        nlohmann::json::object_t bmcLogEntry;
+        LogParseError status = fillAuditLogEntryJson(propertiesList,
+                                                     bmcLogEntry);
+        if (status != LogParseError::success)
+        {
+            BMCWEB_LOG_ERROR << "Failed to parse entry " << objectPath;
+            messages::internalError(asyncResp->res);
+        }
+        else
+        {
+            asyncResp->res.jsonValue.update(bmcLogEntry);
+        }
+    });
 }
 
 void handleLogServicesAuditLogEntriesCollectionGet(
@@ -7033,6 +7008,7 @@ void handleLogServicesAuditLogEntriesCollectionGet(
         return;
     }
 
+    BMCWEB_LOG_DEBUG << "Setting up base fields";
     asyncResp->res.jsonValue["@odata.type"] =
         "#LogEntryCollection.LogEntryCollection";
     asyncResp->res.jsonValue["@odata.id"] =
@@ -7045,8 +7021,10 @@ void handleLogServicesAuditLogEntriesCollectionGet(
     /* Create unique entry for each entry in log file.
      */
     crow::connections::systemBus->async_method_call(
-        [asyncResp, skip, top](const boost::system::error_code ec,
-                               const sdbusplus::message::unix_fd& unixfd) {
+        [asyncResp, skip,
+         top](const boost::system::error_code ec,
+              const dbus::utility::ManagedObjectType& objects) {
+        BMCWEB_LOG_DEBUG << "Lambda to handle objects";
         if (ec)
         {
             BMCWEB_LOG_ERROR << "AuditLog resp_handler got error " << ec;
@@ -7054,11 +7032,11 @@ void handleLogServicesAuditLogEntriesCollectionGet(
             return;
         }
 
-        readAuditLogEntries(asyncResp, unixfd, skip, top);
+        readAuditLogEntries(asyncResp, objects, skip, top);
     },
         "xyz.openbmc_project.Logging.AuditLog",
         "/xyz/openbmc_project/logging/auditlog",
-        "xyz.openbmc_project.Logging.AuditLog", "GetLatestEntries", top);
+        "org.freedesktop.DBus.ObjectManager", "GetManagedObjects");
 }
 
 inline void requestRoutesAuditLogEntryCollection(App& app)
@@ -7086,28 +7064,7 @@ inline void handleLogServicesAuditLogEntryGet(
     }
 
     /* Search for entry matching targetID. */
-    crow::connections::systemBus->async_method_call(
-        [asyncResp, targetID](const boost::system::error_code ec,
-                              const sdbusplus::message::unix_fd& unixfd) {
-        if (ec)
-        {
-            if (ec.value() == EBADR)
-            {
-                messages::resourceNotFound(asyncResp->res, "AuditLog",
-                                           targetID);
-                return;
-            }
-            BMCWEB_LOG_ERROR << "AuditLog resp_handler got error " << ec;
-            messages::internalError(asyncResp->res);
-            return;
-        }
-
-        getAuditLogEntryByID(asyncResp, unixfd, targetID);
-    },
-        "xyz.openbmc_project.Logging.AuditLog",
-        "/xyz/openbmc_project/logging/auditlog",
-        "xyz.openbmc_project.Logging.AuditLog", "GetLatestEntries",
-        query_param::Query::maxTop);
+    getAuditLogEntryByID(asyncResp, targetID);
 }
 
 inline void requestRoutesAuditLogEntry(App& app)
