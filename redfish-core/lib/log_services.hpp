@@ -6679,7 +6679,6 @@ static LogParseError
     nlohmann::json messageArgs = nlohmann::json::array();
     for (const auto& [name, value] : properties)
     {
-        BMCWEB_LOG_DEBUG << "Property found: " << name;
         if (name == "ID")
         {
             logEntryID = std::get_if<std::string>(&value);
@@ -6878,7 +6877,6 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
                          const dbus::utility::ManagedObjectType& objects,
                          size_t skip, size_t top)
 {
-    BMCWEB_LOG_DEBUG << "readAuditLogEntries: " << skip << ":" << top;
     nlohmann::json& logEntryArray = asyncResp->res.jsonValue["Members"];
     if (logEntryArray.empty())
     {
@@ -6893,7 +6891,6 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
          *       consistent count to be returned.
          */
         entryCount++;
-        BMCWEB_LOG_DEBUG << entryCount << ":path: " << objectPath.str;
 
         /* Handle paging using skip (number of entries to skip from the
          * start) and top (number of entries to display).
@@ -7008,7 +7005,6 @@ void handleLogServicesAuditLogEntriesCollectionGet(
         return;
     }
 
-    BMCWEB_LOG_DEBUG << "Setting up base fields";
     asyncResp->res.jsonValue["@odata.type"] =
         "#LogEntryCollection.LogEntryCollection";
     asyncResp->res.jsonValue["@odata.id"] =
@@ -7024,7 +7020,6 @@ void handleLogServicesAuditLogEntriesCollectionGet(
         [asyncResp, skip,
          top](const boost::system::error_code ec,
               const dbus::utility::ManagedObjectType& objects) {
-        BMCWEB_LOG_DEBUG << "Lambda to handle objects";
         if (ec)
         {
             BMCWEB_LOG_ERROR << "AuditLog resp_handler got error " << ec;
