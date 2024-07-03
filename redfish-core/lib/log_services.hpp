@@ -6675,15 +6675,23 @@ static LogParseError
 {
     const std::string* logEntryID = nullptr;
     std::string entryTimeStr;
-    const std::string* messageID = nullptr;
+    const std::string& messageID = "OpenBMC.0.5.AuditLogUsysConfig";
     nlohmann::json messageArgs = nlohmann::json::array();
+    std::map<std::string, uint>::const_iterator mapEntry;
+    const std::map<std::string, uint> msgArgMap({{"Type", 0},
+                                                 {"Operation", 1},
+                                                 {"Account", 2},
+                                                 {"Executable", 3},
+                                                 {"Hostname", 4},
+                                                 {"IPAddress", 5},
+                                                 {"Terminal", 6},
+                                                 {"Result", 7}});
     for (const auto& [name, value] : properties)
     {
         if (name == "ID")
         {
             logEntryID = std::get_if<std::string>(&value);
         }
-
         else if (name == "EventTimestamp")
         {
             const uint64_t* timestamp = std::get_if<std::uint64_t>(&value);
@@ -6692,33 +6700,21 @@ static LogParseError
                 entryTimeStr = redfish::time_utils::getDateTimeUint(*timestamp);
             }
         }
-
-        else if (name == "MessageId")
+        else
         {
-            messageID = std::get_if<std::string>(&value);
-        }
-
-        else if (name == "MessageArgs")
-        {
-            const std::vector<std::string>* msgArgs =
-                std::get_if<std::vector<std::string>>(&value);
-            if (msgArgs != nullptr)
+            /* The rest of the properties either go into the MessageArgs or
+             * they are not part of the response.
+             */
+            mapEntry = msgArgMap.find(name);
+            if (mapEntry != msgArgMap.end())
             {
-                for (const auto& arg : *msgArgs)
-                {
-                    messageArgs.push_back(arg);
-                }
+                messageArgs[mapEntry->second] =
+                    *(std::get_if<std::string>(&value));
             }
         }
     }
 
     // Check that we found all of the expected fields.
-    if ((messageID == nullptr) || messageID->empty())
-    {
-        BMCWEB_LOG_ERROR << "Missing MessageID";
-        return LogParseError::parseFailed;
-    }
-
     if ((logEntryID == nullptr) || logEntryID->empty())
     {
         BMCWEB_LOG_ERROR << "Missing ID";
@@ -6732,11 +6728,11 @@ static LogParseError
     }
 
     // Get the Message from the MessageRegistry
-    const registries::Message* message = registries::getMessage(*messageID);
+    const registries::Message* message = registries::getMessage(messageID);
 
     if (message == nullptr)
     {
-        BMCWEB_LOG_WARNING << "Log entry not found in registry: " << *messageID;
+        BMCWEB_LOG_WARNING << "Log entry not found in registry: " << messageID;
         return LogParseError::messageIdNotInRegistry;
     }
 
@@ -6777,7 +6773,7 @@ static LogParseError
         *logEntryID;
     logEntryJson["Name"] = "Audit Log Entry";
     logEntryJson["Id"] = *logEntryID;
-    logEntryJson["MessageId"] = std::move(*messageID);
+    logEntryJson["MessageId"] = std::move(messageID);
     logEntryJson["Message"] = std::move(msg);
     logEntryJson["MessageArgs"] = std::move(messageArgs);
     logEntryJson["EntryType"] = "Event";
@@ -6877,6 +6873,7 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
                          const dbus::utility::ManagedObjectType& objects,
                          size_t skip, size_t top)
 {
+    BMCWEB_LOG_DEBUG << "readAuditLogEntries: " << skip << ":" << top;
     nlohmann::json& logEntryArray = asyncResp->res.jsonValue["Members"];
     if (logEntryArray.empty())
     {
@@ -6891,6 +6888,7 @@ void readAuditLogEntries(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
          *       consistent count to be returned.
          */
         entryCount++;
+        BMCWEB_LOG_DEBUG << entryCount << ":path: " << objectPath.str;
 
         /* Handle paging using skip (number of entries to skip from the
          * start) and top (number of entries to display).
