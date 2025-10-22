@@ -146,6 +146,9 @@ bool wantDetail(const crow::Request& req)
         case boost::beast::http::verb::delete_:
             return true;
 
+        case boost::beast::http::verb::get:
+            return false;
+
         default:
             // Shouldn't be here, don't log any data
             BMCWEB_LOG_DEBUG("Unexpected verb {}", req.methodString());

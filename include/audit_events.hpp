@@ -34,6 +34,14 @@ inline bool checkPostUser(const crow::Request& req)
            (req.target() == "/login");
 }
 
+inline bool checkGetConsole(const crow::Request& req)
+{
+    BMCWEB_LOG_DEBUG("GET target {}", req.target());
+    return (req.target() == "/console0") ||
+           (req.target() == "/console1") ||
+           (req.target() == "/bmc-console");
+}
+
 /**
  * @brief Checks if request should be audited after completion
  * @return  True if request should be audited
@@ -44,7 +52,9 @@ inline bool wantAudit(const crow::Request& req)
            (req.method() == boost::beast::http::verb::put) ||
            (req.method() == boost::beast::http::verb::delete_) ||
            ((req.method() == boost::beast::http::verb::post) &&
-            !checkPostUser(req));
+            !checkPostUser(req)) ||
+           ((req.method() == boost::beast::http::verb::get) &&
+            checkGetConsole(req));
 }
 
 void auditEvent(const crow::Request& req, const std::string& userName,
